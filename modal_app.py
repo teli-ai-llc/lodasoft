@@ -7,6 +7,7 @@ import os
 import openai
 from openai import OpenAI, OpenAIError, RateLimitError
 from dotenv import load_dotenv
+import time
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -22,28 +23,22 @@ app = App(
     secrets=[modal.Secret.from_name("OPENAI_API_KEY")]
 )
 
-
-# Initialize Quart app
 quart_app = Quart(__name__)
 
 # Set the API key from environment variable
-# openai.api_key = os.getenv("OPENAI_API_KEY") old way of doing it
-
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-# print("OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY"))
 
 # Define the endpoint
 @quart_app.route('/api/teli_response', methods=['POST'])
 async def generate_loan_officer_response():
     try:
+        start_time = time.time()
         raw_data = await request.get_data()  # Get the raw request body
         print(f"Raw data: {raw_data.decode('utf-8')}")
 
         data = json.loads(raw_data.decode('utf-8'))  # Manually load JSON from raw data
-        print(f"Received data: {data}")  # Check what
-        # data = await request.get_json()
-        # print(f"Received data: {data}")  # or use logging.debug if needed
+        print(f"Received data: {data}")
 
         if data is None:
           return jsonify({"error": "Empty or invalid JSON body"}), 400
@@ -59,8 +54,14 @@ async def generate_loan_officer_response():
         unique_id = data.get("unique_id")
         messages = data.get("messages")
 
-        # if not all([first_name, last_name, unique_id, messages]):
-        #     return jsonify({"error": "Missing required fields"}), 400
+        logger.info(f"Processing request for unique_id: {unique_id[:3]}***")
+
+        if not isinstance(data["unique_id"], (str, int)):
+            return jsonify({"error": "unique_id must be a string or integer."}), 400
+
+        if not any(msg["role"] == "customer" for msg in messages):
+            return jsonify({"error": "No customer messages found in the conversation history."}), 400
+
 
         if not isinstance(data["messages"], list) or not all(
             "role" in msg and "content" in msg for msg in data["messages"]
@@ -83,11 +84,6 @@ async def generate_loan_officer_response():
                  "\n".join([f"{msg['role']}: {msg['content']}" for msg in truncated_messages]) + \
                  f"\nCustomer: {last_customer_message}"
 
-        # Formulate the prompt for GPT4o
-        # prompt = f"You're a loan officer. Customer: {last_customer_message}"
-        # print(f"GPT4o Prompt: {prompt}")
-
-        # Using OpenAI API v1.0+
         # Call OpenAI API using the new v1 structure
         response = client.chat.completions.create(
             model="gpt-4o-mini",  # Use the correct model
@@ -95,11 +91,15 @@ async def generate_loan_officer_response():
                 {"role": "system", "content": "You are a helpful and professional loan officer."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=150,
+            max_tokens=min(3000 - len(prompt.split()), 150),  # Adjust tokens
             temperature=0.7
         )
-
         loan_officer_response = response.choices[0].message.content.strip()
+        # Optionally add customer name dynamically
+        loan_officer_response = f"{first_name}, {loan_officer_response}"
+
+        end_time = time.time()
+        logger.info(f"Request processed in {end_time - start_time:.2f} seconds.")
 
         return jsonify({"content": loan_officer_response}), 200
 
