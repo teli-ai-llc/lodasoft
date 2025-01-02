@@ -3,17 +3,33 @@ import modal
 import logging
 from quart import Quart, request, jsonify
 from modal import App, Image, asgi_app
+import os
+import openai
+from openai import OpenAI, OpenAIError, RateLimitError
+from dotenv import load_dotenv
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Create a Modal app with the required image
-image = Image.debian_slim().pip_install("quart")
-app = App("loan-officer-integration", image=image)
+image = Image.debian_slim().pip_install(["quart", "openai"])
+app = App(
+    "loan-officer-integration",
+    image=image,
+    secrets=[modal.Secret.from_name("openai-api-key")]
+)
+
 
 # Initialize Quart app
 quart_app = Quart(__name__)
+
+# Set the API key from environment variable
+# openai.api_key = os.getenv("OPENAI_API_KEY") old way of doing it
+
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+print("OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY"))
 
 # Define the endpoint
 @quart_app.route('/api/teli_response', methods=['POST'])
@@ -27,8 +43,8 @@ async def generate_loan_officer_response():
         # data = await request.get_json()
         # print(f"Received data: {data}")  # or use logging.debug if needed
 
-        # if data is None:
-        #   return jsonify({"error": "Empty or invalid JSON body"}), 400
+        if data is None:
+          return jsonify({"error": "Empty or invalid JSON body"}), 400
 
         first_name = data.get("first_name")
         last_name = data.get("last_name")
@@ -46,9 +62,35 @@ async def generate_loan_officer_response():
         if not last_customer_message:
             return jsonify({"error": "No customer message found in conversation history."}), 400
 
-        loan_officer_response = f"Thank you for reaching out, {first_name}. Here's how I can assist."
+
+        # Formulate the prompt for GPT4o
+        prompt = f"You're a loan officer. Customer: {last_customer_message}"
+        print(f"GPT4o Prompt: {prompt}")
+
+        # Using OpenAI API v1.0+
+        # Call OpenAI API using the new v1 structure
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Use the correct model
+            messages=[
+                {"role": "system", "content": "You are a helpful and professional loan officer. Your goal is to provide clear and concise assistance to customers."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=150,
+            temperature=0.7
+        )
+
+        loan_officer_response = response['choices'][0]['message']['content'].strip()
+
         return jsonify({"content": loan_officer_response}), 200
+
+    except OpenAIError as e:
+        logger.error(f"OpenAI API error: {e}")
+        return jsonify({"error": "OpenAI API error: " + str(e)}), 500
+    except RateLimitError as e:
+        logger.error(f"Rate limit exceeded: {e}")
+        return jsonify({"error": "Rate limit exceeded: " + str(e)}), 429
     except Exception as e:
+        logger.error(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # Set up the ASGI app with the Quart app
