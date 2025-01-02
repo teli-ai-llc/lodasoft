@@ -11,13 +11,15 @@ from dotenv import load_dotenv
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Create a Modal app with the required image
-image = Image.debian_slim().pip_install(["quart", "openai"])
+image = Image.debian_slim().pip_install(["quart", "openai", "python-dotenv"])
+
 app = App(
     "loan-officer-integration",
     image=image,
-    secrets=[modal.Secret.from_name("openai-api-key")]
+    secrets=[modal.Secret.from_name("OPENAI_API_KEY")]
 )
 
 
@@ -29,7 +31,7 @@ quart_app = Quart(__name__)
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-print("OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY"))
+# print("OPENAI_API_KEY:", os.getenv("OPENAI_API_KEY"))
 
 # Define the endpoint
 @quart_app.route('/api/teli_response', methods=['POST'])
@@ -46,13 +48,24 @@ async def generate_loan_officer_response():
         if data is None:
           return jsonify({"error": "Empty or invalid JSON body"}), 400
 
+        # Validate required fields
+        required_fields = ["first_name", "last_name", "unique_id", "messages"]
+        for field in required_fields:
+            if field not in data or not data[field]:
+                return jsonify({"error": f"Missing or empty field: {field}"}), 400
+
         first_name = data.get("first_name")
         last_name = data.get("last_name")
         unique_id = data.get("unique_id")
         messages = data.get("messages")
 
-        if not all([first_name, last_name, unique_id, messages]):
-            return jsonify({"error": "Missing required fields"}), 400
+        # if not all([first_name, last_name, unique_id, messages]):
+        #     return jsonify({"error": "Missing required fields"}), 400
+
+        if not isinstance(data["messages"], list) or not all(
+            "role" in msg and "content" in msg for msg in data["messages"]
+        ):
+            return jsonify({"error": "Invalid messages format"}), 400
 
         last_customer_message = next(
             (msg["content"] for msg in reversed(messages) if msg["role"] == "customer"),
@@ -62,24 +75,31 @@ async def generate_loan_officer_response():
         if not last_customer_message:
             return jsonify({"error": "No customer message found in conversation history."}), 400
 
+        # Truncate conversation history to fit within token limits
+        truncated_messages = truncate_messages(data["messages"])
+
+        # Formulate the prompt for GPT
+        prompt = f"You are a loan officer. Here is the conversation:\n\n" + \
+                 "\n".join([f"{msg['role']}: {msg['content']}" for msg in truncated_messages]) + \
+                 f"\nCustomer: {last_customer_message}"
 
         # Formulate the prompt for GPT4o
-        prompt = f"You're a loan officer. Customer: {last_customer_message}"
-        print(f"GPT4o Prompt: {prompt}")
+        # prompt = f"You're a loan officer. Customer: {last_customer_message}"
+        # print(f"GPT4o Prompt: {prompt}")
 
         # Using OpenAI API v1.0+
         # Call OpenAI API using the new v1 structure
         response = client.chat.completions.create(
             model="gpt-4o-mini",  # Use the correct model
             messages=[
-                {"role": "system", "content": "You are a helpful and professional loan officer. Your goal is to provide clear and concise assistance to customers."},
+                {"role": "system", "content": "You are a helpful and professional loan officer."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=150,
             temperature=0.7
         )
 
-        loan_officer_response = response['choices'][0]['message']['content'].strip()
+        loan_officer_response = response.choices[0].message.content.strip()
 
         return jsonify({"content": loan_officer_response}), 200
 
@@ -92,6 +112,23 @@ async def generate_loan_officer_response():
     except Exception as e:
         logger.error(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+def truncate_messages(messages, max_tokens=3000):
+    """
+    Truncate or summarize older messages to stay within the token limit.
+    """
+    truncated = []
+    total_tokens = 0
+    for msg in reversed(messages):
+        # Estimate tokens (simple approximation)
+        msg_tokens = len(msg["content"].split())
+        if total_tokens + msg_tokens > max_tokens:
+            break
+        truncated.append(msg)
+        total_tokens += msg_tokens
+    return list(reversed(truncated))  # Return in original order
+
 
 # Set up the ASGI app with the Quart app
 @app.function()
